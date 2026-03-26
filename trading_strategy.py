@@ -1,14 +1,15 @@
 """
-Estrategia de Trading: Golden Cross 50/200 + ADX + Trailing Stop
------------------------------------------------------------------
-Filosofía: pocas operaciones, alta calidad, horizonte mínimo de 3 meses.
+Estrategia Swing Trading: MACD + RSI + ATR Stop
+------------------------------------------------
+Horizonte objetivo: 1–4 semanas por operacion.
 
-Señales:
-  COMPRA  : SMA50 cruza SMA200 hacia arriba  AND  ADX > 25  AND  volumen > media 20d
-  SALIDA  : SMA50 cruza SMA200 hacia abajo   OR   trailing stop activado
-            (ambas condiciones respetan un mínimo de 63 días hábiles en posición)
+Señales LONG:
+  ENTRADA : MACD cruza señal hacia arriba  AND  RSI entre 40-65  AND  precio > EMA50
+  SALIDA  : MACD cruza señal hacia abajo   OR   stop loss (1.5x ATR)  OR  take profit (3x ATR)
 
-Indicadores adicionales en el gráfico: RSI, ADX, curva de capital.
+Señales SHORT (opcional, activable):
+  ENTRADA : MACD cruza señal hacia abajo   AND  RSI entre 35-60  AND  precio < EMA50
+  SALIDA  : MACD cruza señal hacia arriba  OR   stop loss (1.5x ATR)  OR  take profit (3x ATR)
 """
 
 import pandas as pd
@@ -16,49 +17,43 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 
 # ──────────────────────────────────────────────
 # Indicadores Técnicos
 # ──────────────────────────────────────────────
 
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).mean()
-
-
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Retorna (macd_line, signal_line, histogram)."""
+    macd_line   = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Average Directional Index — mide la fortaleza de la tendencia (0-100)."""
-    up   = high.diff()
-    down = -low.diff()
-    dm_plus  = np.where((up > down) & (up > 0), up, 0.0)
-    dm_minus = np.where((down > up) & (down > 0), down, 0.0)
-
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average True Range — mide la volatilidad real del precio."""
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low  - close.shift()).abs(),
     ], axis=1).max(axis=1)
-
-    atr    = tr.rolling(period).mean()
-    di_pos = 100 * pd.Series(dm_plus,  index=close.index).rolling(period).mean() / atr
-    di_neg = 100 * pd.Series(dm_minus, index=close.index).rolling(period).mean() / atr
-    dx     = (100 * (di_pos - di_neg).abs() / (di_pos + di_neg).replace(0, np.nan))
-    return dx.rolling(period).mean()
+    return tr.ewm(com=period - 1, adjust=False).mean()
 
 
 # ──────────────────────────────────────────────
@@ -69,10 +64,12 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
 class Trade:
     entry_date:  pd.Timestamp
     entry_price: float
+    side:        Literal["long", "short"] = "long"
+    stop_loss:   float = 0.0
+    take_profit: float = 0.0
     exit_date:   Optional[pd.Timestamp] = None
     exit_price:  Optional[float] = None
     exit_reason: str = ""
-    side: str = "long"
 
     @property
     def hold_days(self) -> Optional[int]:
@@ -84,7 +81,9 @@ class Trade:
     def pnl(self) -> Optional[float]:
         if self.exit_price is None:
             return None
-        return (self.exit_price - self.entry_price) / self.entry_price
+        if self.side == "long":
+            return (self.exit_price - self.entry_price) / self.entry_price
+        return (self.entry_price - self.exit_price) / self.entry_price
 
     @property
     def pnl_pct(self) -> Optional[float]:
@@ -156,9 +155,13 @@ class BacktestResult:
         return (daily_ret.mean() / daily_ret.std()) * np.sqrt(252)
 
     def summary(self) -> str:
+        exit_reasons: dict = {}
+        for t in self.closed_trades:
+            exit_reasons[t.exit_reason] = exit_reasons.get(t.exit_reason, 0) + 1
+
         lines = [
             "=" * 52,
-            "         RESUMEN DEL BACKTESTING",
+            "         RESUMEN DEL BACKTESTING (SWING)",
             "=" * 52,
             f"  Operaciones totales  : {self.total_trades}",
             f"  Win rate             : {self.win_rate:.1f}%",
@@ -167,10 +170,13 @@ class BacktestResult:
             f"  Sharpe ratio         : {self.sharpe_ratio:.2f}",
             f"  Profit factor        : {self.profit_factor:.2f}",
             f"  Ganancia media       : +{self.avg_win_pct:.2f}%",
-            f"  Pérdida media        : {self.avg_loss_pct:.2f}%",
-            f"  Hold promedio (días) : {self.avg_hold_days:.0f}",
-            "=" * 52,
+            f"  Perdida media        : {self.avg_loss_pct:.2f}%",
+            f"  Hold promedio (dias) : {self.avg_hold_days:.1f}",
+            "  Salidas por razon    :",
         ]
+        for reason, count in sorted(exit_reasons.items()):
+            lines.append(f"    {reason:<20}: {count}")
+        lines.append("=" * 52)
         return "\n".join(lines)
 
 
@@ -179,26 +185,23 @@ class BacktestResult:
 # ──────────────────────────────────────────────
 
 def generate_price_data(
-    n_days: int = 2500,
+    n_days: int = 750,
     start_price: float = 100.0,
-    volatility: float = 0.013,
-    seed: int = 42,
+    volatility: float = 0.014,
+    seed: int = 7,
 ) -> pd.DataFrame:
     """
-    Genera OHLCV con ciclos alcistas/bajistas alternados de ~6-12 meses
-    para que la estrategia de largo plazo tenga señales realistas.
+    ~3 años de datos con ciclos swing realistas (30-90 dias por ciclo).
     """
     np.random.seed(seed)
     dates = pd.bdate_range(end=pd.Timestamp("2026-03-26"), periods=n_days)
 
-    # Ciclos de mercado: cada ciclo dura entre 120 y 300 días hábiles
     drift_array = np.empty(n_days)
-    i = 0
-    bullish = True
+    i, bullish = 0, True
     while i < n_days:
-        cycle_len = np.random.randint(120, 300)
-        drift = 0.0006 if bullish else -0.0004
-        end = min(i + cycle_len, n_days)
+        cycle_len = np.random.randint(30, 90)      # ciclos cortos para swing
+        drift = 0.0008 if bullish else -0.0005
+        end   = min(i + cycle_len, n_days)
         drift_array[i:end] = drift
         bullish = not bullish
         i = end
@@ -209,11 +212,9 @@ def generate_price_data(
     daily_vol = np.abs(np.random.normal(0, volatility * 0.5, n_days))
     high   = close * (1 + daily_vol)
     low    = close * (1 - daily_vol)
-    open_  = np.roll(close, 1)
-    open_[0] = start_price
-
-    base_vol = np.random.randint(1_000_000, 3_000_000, n_days)
-    volume   = (base_vol * (1 + np.abs(returns) * 15)).astype(int)
+    open_  = np.roll(close, 1);  open_[0] = start_price
+    base_v = np.random.randint(1_000_000, 4_000_000, n_days)
+    volume = (base_v * (1 + np.abs(returns) * 12)).astype(int)
 
     return pd.DataFrame(
         {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
@@ -222,123 +223,180 @@ def generate_price_data(
 
 
 # ──────────────────────────────────────────────
-# Estrategia
+# Estrategia Swing
 # ──────────────────────────────────────────────
 
-class GoldenCrossADXStrategy:
+class SwingMACDStrategy:
     """
-    Estrategia de largo plazo: Golden Cross + ADX + Trailing Stop
+    Swing Trading: MACD + RSI + ATR-Stop
 
     Parámetros
     ----------
-    fast_ma        : período SMA rápida (50 por defecto)
-    slow_ma        : período SMA lenta  (200 por defecto)
-    adx_period     : período del ADX
-    adx_threshold  : ADX mínimo para confirmar tendencia (25 = tendencia fuerte)
-    vol_period     : período de la media de volumen para filtro
-    trailing_pct   : trailing stop en % desde el máximo desde la entrada
-    min_hold_days  : días hábiles mínimos antes de poder salir (≈3 meses = 63)
+    macd_fast      : EMA rápida del MACD (default 12)
+    macd_slow      : EMA lenta del MACD  (default 26)
+    macd_signal    : EMA de la línea de señal (default 9)
+    rsi_period     : período del RSI
+    rsi_buy_min/max: rango del RSI para entrar largo (momentum positivo, sin sobrecompra)
+    rsi_sell_min/max: rango del RSI para entrar corto
+    ema_trend      : EMA para filtro de tendencia general
+    atr_period     : período del ATR
+    atr_sl_mult    : multiplicador ATR para stop loss
+    atr_tp_mult    : multiplicador ATR para take profit
+    allow_short    : permitir posiciones cortas
     initial_cash   : capital inicial en USD
     """
 
     def __init__(
         self,
-        fast_ma: int        = 50,
-        slow_ma: int        = 200,
-        adx_period: int     = 14,
-        adx_threshold: float = 25.0,
-        vol_period: int     = 20,
-        trailing_pct: float = 0.15,
-        min_hold_days: int  = 63,
+        macd_fast: int      = 12,
+        macd_slow: int      = 26,
+        macd_signal: int    = 9,
+        rsi_period: int     = 14,
+        rsi_buy_min: float  = 40.0,
+        rsi_buy_max: float  = 65.0,
+        rsi_sell_min: float = 35.0,
+        rsi_sell_max: float = 60.0,
+        ema_trend: int      = 50,
+        atr_period: int     = 14,
+        atr_sl_mult: float  = 1.5,
+        atr_tp_mult: float  = 3.0,
+        allow_short: bool   = True,
         initial_cash: float = 10_000.0,
     ):
-        self.fast_ma       = fast_ma
-        self.slow_ma       = slow_ma
-        self.adx_period    = adx_period
-        self.adx_threshold = adx_threshold
-        self.vol_period    = vol_period
-        self.trailing_pct  = trailing_pct
-        self.min_hold_days = min_hold_days
-        self.initial_cash  = initial_cash
+        self.macd_fast    = macd_fast
+        self.macd_slow    = macd_slow
+        self.macd_signal  = macd_signal
+        self.rsi_period   = rsi_period
+        self.rsi_buy_min  = rsi_buy_min
+        self.rsi_buy_max  = rsi_buy_max
+        self.rsi_sell_min = rsi_sell_min
+        self.rsi_sell_max = rsi_sell_max
+        self.ema_trend    = ema_trend
+        self.atr_period   = atr_period
+        self.atr_sl_mult  = atr_sl_mult
+        self.atr_tp_mult  = atr_tp_mult
+        self.allow_short  = allow_short
+        self.initial_cash = initial_cash
 
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         data = df.copy()
-        data["sma_fast"] = sma(data["close"], self.fast_ma)
-        data["sma_slow"] = sma(data["close"], self.slow_ma)
-        data["adx"]      = adx(data["high"], data["low"], data["close"], self.adx_period)
-        data["rsi"]      = rsi(data["close"])
-        data["vol_avg"]  = data["volume"].rolling(self.vol_period).mean()
+        data["macd"], data["macd_sig"], data["macd_hist"] = macd(
+            data["close"], self.macd_fast, self.macd_slow, self.macd_signal
+        )
+        data["rsi"]      = rsi(data["close"], self.rsi_period)
+        data["ema_trend"] = ema(data["close"], self.ema_trend)
+        data["atr"]       = atr(data["high"], data["low"], data["close"], self.atr_period)
 
-        cross = np.sign(data["sma_fast"] - data["sma_slow"])
-        data["cross_signal"] = cross.diff()
+        # Cruce del MACD: +1 cruce alcista, -1 cruce bajista
+        cross            = np.sign(data["macd"] - data["macd_sig"])
+        data["macd_cross"] = cross.diff()
         return data
 
     def backtest(self, df: pd.DataFrame):
         data = self.compute_indicators(df)
-
-        cash   = self.initial_cash
-        shares = 0.0
-        result = BacktestResult()
-        equity_values: List[float] = []
-
-        current_trade: Optional[Trade] = None
-        peak_price: float = 0.0
-        hold_count: int   = 0       # días hábiles en posición
-
-        # columna para marcar señales en el gráfico
         data["signal"] = 0
+
+        cash          = self.initial_cash
+        result        = BacktestResult()
+        equity_vals   : List[float] = []
+        current_trade : Optional[Trade] = None
+
+        # Estado de posición activa
+        in_position   = False
+        pos_side      : str   = "long"
+        pos_shares    : float = 0.0
+        pos_entry_val : float = 0.0   # capital comprometido al entrar
 
         for date, row in data.iterrows():
             price = row["close"]
 
-            if shares == 0:
-                # ── Condición de ENTRADA ───────────────────────────────────
-                golden_cross    = row["cross_signal"] > 0
-                trend_confirmed = row["adx"] > self.adx_threshold
-                high_volume     = row["volume"] > row["vol_avg"]
+            if not in_position:
+                # ── ENTRADA LONG ────────────────────────────────────────────
+                long_signal = (
+                    row["macd_cross"] > 0
+                    and self.rsi_buy_min <= row["rsi"] <= self.rsi_buy_max
+                    and price > row["ema_trend"]
+                )
+                # ── ENTRADA SHORT ───────────────────────────────────────────
+                short_signal = self.allow_short and (
+                    row["macd_cross"] < 0
+                    and self.rsi_sell_min <= row["rsi"] <= self.rsi_sell_max
+                    and price < row["ema_trend"]
+                )
 
-                if golden_cross and trend_confirmed and high_volume:
-                    shares = cash / price
-                    cash   = 0.0
-                    peak_price    = price
-                    hold_count    = 0
-                    current_trade = Trade(entry_date=date, entry_price=price)
+                if long_signal or short_signal:
+                    pos_side      = "long" if long_signal else "short"
+                    atr_v         = row["atr"]
+                    sl = price - self.atr_sl_mult * atr_v if pos_side == "long" else price + self.atr_sl_mult * atr_v
+                    tp = price + self.atr_tp_mult * atr_v if pos_side == "long" else price - self.atr_tp_mult * atr_v
+
+                    pos_entry_val = cash
+                    pos_shares    = cash / price
+                    cash          = 0.0
+                    in_position   = True
+
+                    current_trade = Trade(
+                        entry_date=date, entry_price=price,
+                        side=pos_side, stop_loss=sl, take_profit=tp,
+                    )
                     result.trades.append(current_trade)
-                    data.at[date, "signal"] = 1
+                    data.at[date, "signal"] = 1 if pos_side == "long" else -1
 
             else:
-                hold_count += 1
-                peak_price  = max(peak_price, price)
+                t = current_trade
+                exit_reason = None
 
-                # ── Condición de SALIDA ────────────────────────────────────
-                death_cross   = row["cross_signal"] < 0
-                trailing_stop = price < peak_price * (1 - self.trailing_pct)
+                if pos_side == "long":
+                    if price <= t.stop_loss:
+                        exit_reason = "stop_loss"
+                    elif price >= t.take_profit:
+                        exit_reason = "take_profit"
+                    elif row["macd_cross"] < 0:
+                        exit_reason = "macd_cross"
+                else:  # short
+                    if price >= t.stop_loss:
+                        exit_reason = "stop_loss"
+                    elif price <= t.take_profit:
+                        exit_reason = "take_profit"
+                    elif row["macd_cross"] > 0:
+                        exit_reason = "macd_cross"
 
-                can_exit = hold_count >= self.min_hold_days
+                if exit_reason:
+                    # PnL real aplicado al capital comprometido
+                    pnl_ratio = (price - t.entry_price) / t.entry_price
+                    if pos_side == "short":
+                        pnl_ratio = -pnl_ratio
+                    cash        = pos_entry_val * (1 + pnl_ratio)
+                    in_position = False
+                    pos_shares  = 0.0
 
-                if can_exit and (death_cross or trailing_stop):
-                    reason = "death_cross" if death_cross else "trailing_stop"
-                    cash   = shares * price
-                    shares = 0.0
-                    if current_trade is not None:
-                        current_trade.exit_date   = date
-                        current_trade.exit_price  = price
-                        current_trade.exit_reason = reason
-                        current_trade = None
-                    data.at[date, "signal"] = -1
+                    t.exit_date   = date
+                    t.exit_price  = price
+                    t.exit_reason = exit_reason
+                    current_trade = None
+                    data.at[date, "signal"] = -1 if pos_side == "long" else 1
 
-            equity = cash + shares * price
-            equity_values.append(equity)
+            # Equity mark-to-market
+            if in_position:
+                pnl_ratio = (price - current_trade.entry_price) / current_trade.entry_price
+                if pos_side == "short":
+                    pnl_ratio = -pnl_ratio
+                equity_vals.append(pos_entry_val * (1 + pnl_ratio))
+            else:
+                equity_vals.append(cash)
 
-        # Cerrar posición abierta al cierre del período
-        if shares > 0 and current_trade is not None:
-            last_price = data["close"].iloc[-1]
-            cash = shares * last_price
+        # Cerrar posición abierta al fin del período
+        if in_position and current_trade is not None:
+            last = data["close"].iloc[-1]
+            pnl_ratio = (last - current_trade.entry_price) / current_trade.entry_price
+            if pos_side == "short":
+                pnl_ratio = -pnl_ratio
+            cash = pos_entry_val * (1 + pnl_ratio)
             current_trade.exit_date   = data.index[-1]
-            current_trade.exit_price  = last_price
+            current_trade.exit_price  = last
             current_trade.exit_reason = "fin_periodo"
 
-        result.equity_curve = pd.Series(equity_values, index=data.index)
+        result.equity_curve = pd.Series(equity_vals, index=data.index)
         return result, data
 
 
@@ -347,55 +405,56 @@ class GoldenCrossADXStrategy:
 # ──────────────────────────────────────────────
 
 def plot_results(data: pd.DataFrame, result: BacktestResult, ticker: str = "ACTIVO"):
-    fig = plt.figure(figsize=(15, 11))
+    fig = plt.figure(figsize=(15, 12))
     fig.suptitle(
-        f"Golden Cross 50/200 + ADX + Trailing Stop — {ticker}\n"
+        f"Swing Trading: MACD + RSI + ATR-Stop — {ticker}\n"
         f"Win Rate: {result.win_rate:.1f}%  |  "
         f"Retorno: {result.total_return:.2f}%  |  "
         f"Sharpe: {result.sharpe_ratio:.2f}  |  "
-        f"Hold promedio: {result.avg_hold_days:.0f} días",
-        fontsize=12,
+        f"Trades: {result.total_trades}  |  "
+        f"Hold prom: {result.avg_hold_days:.0f} dias",
+        fontsize=11,
     )
-    gs = gridspec.GridSpec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.4)
+    gs = gridspec.GridSpec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.42)
 
-    # ── Panel 1: Precio + SMAs + señales
+    # ── Panel 1: Precio + EMA50 + señales
     ax1 = fig.add_subplot(gs[0])
-    ax1.plot(data.index, data["close"],    label="Precio cierre", color="black",  lw=1.0, alpha=0.85)
-    ax1.plot(data.index, data["sma_fast"], label=f"SMA {50}",      color="blue",   lw=1.2)
-    ax1.plot(data.index, data["sma_slow"], label=f"SMA {200}",     color="orange", lw=1.4)
+    ax1.plot(data.index, data["close"],     label="Precio",  color="black",  lw=1.0)
+    ax1.plot(data.index, data["ema_trend"], label="EMA 50",  color="orange", lw=1.2, ls="--")
 
-    # Marcar zonas de posición abierta
     for t in result.closed_trades:
-        ax1.axvspan(t.entry_date, t.exit_date, alpha=0.07,
-                    color="green" if (t.pnl or 0) > 0 else "red")
+        color = "green" if (t.pnl or 0) > 0 else "red"
+        ax1.axvspan(t.entry_date, t.exit_date, alpha=0.08, color=color)
 
-    buys  = data[data["signal"] == 1]
-    sells = data[data["signal"] == -1]
-    ax1.scatter(buys.index,  buys["close"],  marker="^", color="green", s=100, zorder=5, label="Compra")
-    ax1.scatter(sells.index, sells["close"], marker="v", color="red",   s=100, zorder=5, label="Venta")
+    longs  = data[(data["signal"] == 1)]
+    shorts = data[(data["signal"] == -1)]
+    ax1.scatter(longs.index,  longs["close"],  marker="^", color="green", s=90, zorder=5, label="Entrada Long")
+    ax1.scatter(shorts.index, shorts["close"], marker="v", color="red",   s=90, zorder=5, label="Entrada Short / Salida")
 
     ax1.set_ylabel("Precio (USD)")
     ax1.legend(fontsize=8, loc="upper left")
     ax1.grid(alpha=0.25)
 
-    # ── Panel 2: ADX
+    # ── Panel 2: MACD
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    ax2.plot(data.index, data["adx"], color="darkcyan", lw=1)
-    ax2.axhline(25, color="red", ls="--", lw=0.8, label="Umbral 25")
-    ax2.fill_between(data.index, data["adx"], 25,
-                     where=data["adx"] > 25, alpha=0.2, color="darkcyan")
-    ax2.set_ylabel("ADX")
-    ax2.set_ylim(0, 80)
-    ax2.legend(fontsize=8)
+    ax2.plot(data.index, data["macd"],     label="MACD",   color="blue",   lw=1)
+    ax2.plot(data.index, data["macd_sig"], label="Señal",  color="orange", lw=1)
+    colors = ["green" if v >= 0 else "red" for v in data["macd_hist"]]
+    ax2.bar(data.index, data["macd_hist"], color=colors, alpha=0.5, width=0.8, label="Histograma")
+    ax2.axhline(0, color="black", lw=0.6, ls="--")
+    ax2.set_ylabel("MACD")
+    ax2.legend(fontsize=7, loc="upper left")
     ax2.grid(alpha=0.25)
 
     # ── Panel 3: RSI
     ax3 = fig.add_subplot(gs[2], sharex=ax1)
     ax3.plot(data.index, data["rsi"], color="purple", lw=1)
-    ax3.axhline(70, color="red",   ls="--", lw=0.8)
-    ax3.axhline(30, color="green", ls="--", lw=0.8)
+    ax3.axhline(65, color="red",   ls="--", lw=0.8, label="RSI 65")
+    ax3.axhline(40, color="green", ls="--", lw=0.8, label="RSI 40")
+    ax3.fill_between(data.index, 40, 65, alpha=0.07, color="blue", label="Zona entrada")
     ax3.set_ylabel("RSI")
     ax3.set_ylim(0, 100)
+    ax3.legend(fontsize=7, loc="upper left")
     ax3.grid(alpha=0.25)
 
     # ── Panel 4: Curva de capital
@@ -415,18 +474,24 @@ def plot_results(data: pd.DataFrame, result: BacktestResult, ticker: str = "ACTI
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Generando datos de precio simulados (2500 dias habiles, ~10 años)...")
-    df = generate_price_data(n_days=2500)
+    print("Generando datos de precio simulados (~3 años)...")
+    df = generate_price_data(n_days=750)
 
-    strategy = GoldenCrossADXStrategy(
-        fast_ma        = 30,
-        slow_ma        = 100,
-        adx_period     = 14,
-        adx_threshold  = 20.0,   # tendencia moderada-fuerte
-        vol_period     = 20,
-        trailing_pct   = 0.18,   # trailing stop del 18%
-        min_hold_days  = 63,     # mínimo ~3 meses (63 días hábiles)
-        initial_cash   = 10_000.0,
+    strategy = SwingMACDStrategy(
+        macd_fast     = 12,
+        macd_slow     = 26,
+        macd_signal   = 9,
+        rsi_period    = 14,
+        rsi_buy_min   = 40.0,   # RSI mínimo para entrar largo
+        rsi_buy_max   = 65.0,   # RSI máximo (evita sobrecompra)
+        rsi_sell_min  = 35.0,   # RSI mínimo para entrar corto
+        rsi_sell_max  = 60.0,   # RSI máximo para entrar corto
+        ema_trend     = 50,     # filtro de tendencia
+        atr_period    = 14,
+        atr_sl_mult   = 1.5,    # stop loss = 1.5x ATR
+        atr_tp_mult   = 3.0,    # take profit = 3.0x ATR  (ratio 1:2)
+        allow_short   = True,
+        initial_cash  = 10_000.0,
     )
 
     print("Ejecutando backtesting...")
@@ -434,19 +499,19 @@ if __name__ == "__main__":
 
     print(result.summary())
 
-    print("\nDetalle de todas las operaciones:")
-    print(f"{'Entrada':<12} {'P.Entrada':>10} {'Salida':<12} {'P.Salida':>10} "
-          f"{'PnL%':>8} {'Días':>6} {'Razón':<14}")
-    print("-" * 70)
+    print(f"\n{'Entrada':<12} {'Side':<6} {'P.Entrada':>10} {'Salida':<12} "
+          f"{'P.Salida':>10} {'PnL%':>8} {'Dias':>5} {'Razon'}")
+    print("-" * 74)
     for t in result.closed_trades:
         print(
             f"{str(t.entry_date.date()):<12} "
+            f"{t.side:<6} "
             f"{t.entry_price:>10.2f} "
             f"{str(t.exit_date.date()):<12} "
             f"{t.exit_price:>10.2f} "
             f"{t.pnl_pct:>+8.2f}% "
-            f"{t.hold_days:>6} "
-            f"{t.exit_reason:<14}"
+            f"{t.hold_days:>5} "
+            f"{t.exit_reason}"
         )
 
-    plot_results(data, result, ticker="SIM-1500")
+    plot_results(data, result, ticker="SIM-750")
